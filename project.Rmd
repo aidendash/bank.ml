@@ -1,0 +1,234 @@
+---
+title: "Classifying Term Deposit Subscriptions Using Machine Learning"
+author: "Aiden Liu"
+output:
+  html_document: default
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Variable Description
+-age
+
+-job - type of job (categorical:'admin.','blue-collar','entrepreneur','housemaid','management','retired','self-employed','services','student','technician','unemployed','unknown')	
+
+-marital - marital status (categorical: 'divorced','married','single','unknown'; note: 'divorced' means divorced or widowed)	
+
+-education - (categorical: 'basic.4y','basic.6y','basic.9y','high.school','illiterate','professional.course','university.degree','unknown')	
+
+-default - has credit in default?	
+
+-balance - average yearly balance	
+
+-housing - has housing loan?	
+
+-loan - has personal loan?	
+
+-contact - contact communication type (categorical: 'cellular','telephone')	
+
+-day_of_week - last contact day of the week	
+
+-month - last contact month of year (categorical: 'jan', 'feb', 'mar', ..., 'nov', 'dec')	
+
+-duration - last contact duration, in seconds (numeric)
+
+-day - date of the month
+
+-campaign - number of contacts performed during this campaign and for this client (numeric, includes last contact)	
+
+-pdays - number of days that passed by after the client was last contacted from a previous campaign (numeric; -1 means client was not previously contacted)	
+
+-previous - number of contacts performed before this campaign and for this client	
+
+-poutcome - outcome of the previous marketing campaign (categorical: 'failure','nonexistent','success')	
+
+-y - has the client subscribed a term deposit?	
+
+# Libraries
+```{r, warning =FALSE, message=FALSE}
+library(readr)
+library(dplyr)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(caret)
+library(caTools)
+library(pROC)
+library(car)
+library(glmnet)
+library(gbm)
+```
+
+# Reading in the data
+```{r, message=FALSE,warning=FALSE}
+bank.data = read_delim("bank.csv", delim = ";", 
+    escape_double = FALSE, trim_ws = TRUE)
+```
+
+Inspecting the class of each variable
+```{r}
+sapply(bank.data, class)
+```
+Adjusting all binary and character variables into factors
+```{r}
+cat_vars = c("default", "housing", "loan", "y", "job", "marital", "education", "contact", "month", "poutcome")
+bank.data[cat_vars] = lapply(bank.data[cat_vars], factor)
+```
+
+```{r redundancy-check}
+all((bank.data$pdays == -1) == (bank.data$poutcome == "unknown"))   # TRUE means they are the same set of rows
+```
+
+```{r}
+sapply(bank.data,class)
+```
+
+Checking for any NA values in the dataset
+```{r}
+any(is.na(bank.data)) # Finding if there are any NA values in our dataset
+```
+
+Remove unnecessary column
+```{r}
+bank.data$day = NULL # Removing date of the month
+```
+
+A large number of previous number of days that passed by after the client was last contacted from a previous campaign are -1, indicating most of the clients have not been contacted before. Therefore, I will remove pdays.
+```{r}
+bank.data$pdays = NULL
+```
+
+Also note, 'duration' does not tell us who to call in order to improve the likelihood of a customer saying yes to our term deposit scheme. 
+```{r}
+bank.data$duration = NULL
+```
+
+Splitting the data into training and test sets
+```{r}
+set.seed(893)
+# Splitting data in train and test data 
+split = sample.split(bank.data$y, SplitRatio = 0.7) # 70-30 split for training vs test set
+
+train.data = subset(bank.data, split == "TRUE") # Subsetting dataset into training set
+test.data = subset(bank.data, split == "FALSE") # Subsetting dataset into test set
+test.y = test.data$y
+```
+
+Is the dataset imbalanced?
+```{r}
+ggplot(data = bank.data, mapping = aes(y=y))+
+  geom_bar(fill="orange")+
+  labs(x="Count", y="Result Type", title="Count of clients subscribing to a term deposit vs not")+
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+Massively imbalanced dataset where there more negative case is the majority class, and the positive case is the minority class.
+
+Fitting a decision tree with all possible variables
+```{r}
+tree_model = rpart(y~ ., data = train.data, method = "class")
+```
+
+Creating predictions and confusion matrix based on the decision tree
+```{r}
+predictions = predict(tree_model, newdata = test.data, type = "class") # Predictions
+
+conf_matrix = confusionMatrix(predictions, test.y) # Building Confusion matrix
+print(conf_matrix$byClass)
+```
+
+How about a Logistic Regression method? Logistic Regression delivers highly interpretable probability scores even with high-dimensional data, effectively maps feature relationships without requiring massive computational power, eliminates the risk of complex black-box predictions, and reduces the risk of overfitting by incorporating regularization techniques like L1 or L2 penalties.
+```{r}
+first.model = glm(y~., data = train.data, family="binomial")
+summary(first.model)
+```
+
+```{r}
+exp(coef(first.model))
+```
+
+Let's check for multicollinearity
+```{r}
+vif(first.model)
+```
+
+Consider performing Lasso Regularisation to tackle overfitting
+```{r}
+x = model.matrix(y ~ ., train.data)[, -1] #dummy code factors
+cv = cv.glmnet(x, as.integer(train.data$y == "yes"), family = "binomial",
+                alpha = 1, type.measure = "auc", nfolds = 10)
+plot(cv)
+p = predict(cv, model.matrix(y ~ ., test.data)[, -1], s = "lambda.min", type = "response")
+auc(roc(test.data$y, p, levels = c("no", "yes")))
+```
+What about a Random Forest model?
+```{r}
+set.seed(893)
+rf_fit = randomForest(y ~ ., data = train.data,
+                      ntree = 500,        # number of trees
+                      importance = TRUE)  # needed for the importance plot
+
+# Predicted probability of "yes" on the test set
+p_rf = predict(rf_fit, newdata = test.data, type = "prob")[, "yes"]
+
+auc(roc(test.data$y, p_rf, levels = c("no", "yes")))
+
+varImpPlot(rf_fit)   # which variables matter most
+```
+0.74 AUC is decent. Let's see if we can do better using a gradient boosting model.
+
+Building a GBM
+```{r}
+# gbm needs a 0/1 numeric outcome (not a factor)
+train.data$y01 = as.integer(train.data$y == "yes")
+test.data$y01 = as.integer(test.data$y == "yes")
+
+set.seed(893)
+gbm_fit = gbm(y01 ~ . - y,                      # "- y" keeps the original label out of the predictors
+               data = train.data,
+               distribution = "bernoulli",       # binary outcome (logistic loss)
+               n.trees = 1000,                   # maximum number of trees
+               interaction.depth = 2,            # size of each tree
+               shrinkage = 0.05,                 # learning rate
+               n.minobsinnode = 20,              # minimum rows in a leaf
+               bag.fraction = 0.7,               # each tree uses a random 70% of rows
+               cv.folds = 5,                     # cross-validation to choose the number of trees
+               verbose = FALSE)
+
+best_trees = gbm.perf(gbm_fit, method = "cv")   # plot of CV error; returns the best tree count
+best_trees                                       # should be well below 1000
+
+p1 = predict(gbm_fit, test.data, n.trees = best_trees, type = "response")
+auc(roc(test.data$y, p1, levels = c("no", "yes")))
+
+summary(gbm_fit, n.trees = best_trees)           # variable importance
+```
+0.75 (2sf) AUC is the limit with this dataset it seems.
+
+# Final model
+```{r}
+# Final model
+print(gbm_fit)
+```
+
+# Actionable insight
+The most important features in the model are the month of contact (31% of relative influence) and the outcome of the previous campaign (29%), followed by balance (11%), job (8%) and age (7.5%). duration was deliberately excluded, because call length is only known after the call and cannot guide whom to contact.
+
+As per the partial dependence plots (PDPs), the predicted probability of a “yes” is far higher for clients whose previous campaign was a success (about 45%) than for those with a previous failure or no previous contact (about 8 to 9%). It also varies strongly with the month of contact: it is highest in October (about 30%), December (23%) and March (21%), and lowest in January, May, July and November (about 7%).
+
+For age, the predicted probability is slightly higher for the youngest clients (around 13% at age 19) and for clients over about 65 (around 14%), and lowest for ages 30 to 60 (around 9%). For balance, the relationship is weak and does not increase: the probability is somewhat higher for low balances (about 12 to 13% below roughly 3,000) and flattens at about 5% above roughly 16,000, where there are few clients.
+
+Therefore there are 3 key takeaways from the PDP plots:
+
+Prioritise clients with a previous successful campaign. They are the group most likely to subscribe again, although this group is small (129 clients in the data).
+
+Plan contact timing around the seasonal pattern. Contact rates were most successful in October, December and March, and least in May, July and November. This is an association in one campaign dataset, and it should be tested before shifting effort, because the data has no year variable to confirm it repeats.
+
+Do not rely on age or balance to narrow the target list. Their effects are modest and not monotonic. Younger and older clients show slightly higher rates, and higher balances do not increase the likelihood of a “yes”.
+
+Using these scores to rank clients, contacting the top 20% would reach about 53% of all subscribers (about 2.7 times better than random).
